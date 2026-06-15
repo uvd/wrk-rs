@@ -1,0 +1,30 @@
+[package]
+name = "wrk-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A modern HTTP benchmarking tool — a Rust reimplementation of wrk"
+license = "Apache-2.0"
+
+[[bin]]
+name = "wrk"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
