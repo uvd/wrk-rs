@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use config::Config;
-use connection::Counters;
+use connection::CounterSnapshot;
 use stats::Stats;
 
 pub const MAX_THREAD_RATE_S: u64 = 10_000_000;
@@ -44,8 +44,8 @@ fn main() {
     let latency = Arc::new(Stats::alloc(latency_max));
     let requests_stats = Arc::new(Stats::alloc(MAX_THREAD_RATE_S));
 
-    // Global shared counters (summed across all workers).
-    let counters = Arc::new(Counters::default());
+    // Counters are now per-worker (see worker.rs); we sum their snapshots here
+    // after the workers join. No global contended atomics on the hot path.
     let stop = Arc::new(AtomicBool::new(false));
 
     // Print the run header (mirrors wrk.c:137-139), annotated with the
@@ -84,7 +84,6 @@ fn main() {
                 let cfg = cfg.clone();
                 let latency = latency.clone();
                 let requests_stats = requests_stats.clone();
-                let counters = counters.clone();
                 let stop = stop.clone();
                 let endpoint = endpoint.clone();
                 handles.push(std::thread::spawn(move || {
@@ -93,10 +92,9 @@ fn main() {
                         per_thread,
                         latency,
                         requests_stats,
-                        counters,
                         stop,
                         endpoint,
-                    );
+                    )
                 }));
             }
         }
@@ -109,7 +107,6 @@ fn main() {
                 let cfg = cfg.clone();
                 let latency = latency.clone();
                 let requests_stats = requests_stats.clone();
-                let counters = counters.clone();
                 let stop = stop.clone();
                 let tls = tls.clone();
                 let server_name = server_name.clone();
@@ -119,11 +116,10 @@ fn main() {
                         per_thread,
                         latency,
                         requests_stats,
-                        counters,
                         stop,
                         tls,
                         server_name,
-                    );
+                    )
                 }));
             }
         }
@@ -134,7 +130,6 @@ fn main() {
                 let cfg = cfg.clone();
                 let latency = latency.clone();
                 let requests_stats = requests_stats.clone();
-                let counters = counters.clone();
                 let stop = stop.clone();
                 let tls = tls.clone();
                 let server_name = server_name.clone();
@@ -144,11 +139,10 @@ fn main() {
                         per_thread,
                         latency,
                         requests_stats,
-                        counters,
                         stop,
                         tls,
                         server_name,
-                    );
+                    )
                 }));
             }
         }
@@ -158,12 +152,19 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_secs(cfg.duration));
     stop.store(true, Ordering::Relaxed);
 
+    // Each worker returns its own counter snapshot; sum them here (plain adds,
+    // no atomics). No global counters were shared on the hot path.
+    let mut snapshots: Vec<CounterSnapshot> = Vec::with_capacity(handles.len());
     for h in handles {
-        let _ = h.join();
+        match h.join() {
+            Ok(s) => snapshots.push(s),
+            Err(_) => snapshots.push(CounterSnapshot::default()),
+        }
     }
+    let total = CounterSnapshot::sum(&snapshots);
 
     let runtime_us = wall_start.elapsed().as_micros() as u64;
-    let complete = counters.complete.load(Ordering::Relaxed);
+    let complete = total.complete;
 
     // Coordinated-omission correction (mirrors wrk.c:168-171):
     // expected = runtime_us / (complete / connections)
@@ -175,14 +176,14 @@ fn main() {
 
     let r = report::Report {
         complete,
-        bytes: counters.bytes.load(Ordering::Relaxed),
+        bytes: total.bytes,
         runtime_us,
         protocol: resolved,
-        errors_connect: counters.errors_connect.load(Ordering::Relaxed),
-        errors_read: counters.errors_read.load(Ordering::Relaxed),
-        errors_write: counters.errors_write.load(Ordering::Relaxed),
-        errors_timeout: counters.errors_timeout.load(Ordering::Relaxed),
-        errors_status: counters.errors_status.load(Ordering::Relaxed),
+        errors_connect: total.errors_connect,
+        errors_read: total.errors_read,
+        errors_write: total.errors_write,
+        errors_timeout: total.errors_timeout,
+        errors_status: total.errors_status,
         latency: &latency,
         requests: &requests_stats,
         print_latency: cfg.latency,

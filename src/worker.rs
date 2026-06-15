@@ -15,40 +15,57 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use quinn::Endpoint;
-use tokio::runtime::Runtime;
+use tokio::runtime::Builder;
 use tokio::task::LocalSet;
 
+/// Build a single-threaded current_thread runtime. This is the crux of wrk's
+/// model: ONE event loop per OS thread, giving perfect cache locality and zero
+/// cross-thread scheduling. Using `Runtime::new()` here instead would spawn a
+/// *multi-thread* runtime (num_cpus worker threads) per worker — so `-t N`
+/// quietly creates `N × num_cpus` tokio threads contending for the cores, and
+/// throughput *falls* as `-t` rises. We measured exactly that regression.
+fn worker_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    Builder::new_current_thread().enable_all().build()
+}
+
 use crate::config::Config;
-use crate::connection::{Counters, run_connection};
+use crate::connection::{Counters, CounterSnapshot, run_connection};
 use crate::h3::run_h3_connection;
 use crate::stats::Stats;
 
 pub const RECORD_INTERVAL_MS: u64 = 100;
 
 /// Run a worker on the current OS thread with a current_thread runtime.
-/// Returns when `stop` is set (signalled by the rate recorder exiting the loop).
+/// Returns this worker's counter snapshot when `stop` is set (signalled by the
+/// rate recorder exiting the loop). The snapshot is summed across workers in
+/// main; the counters themselves are never shared across cores.
 #[allow(clippy::too_many_arguments)]
 pub fn run_worker(
     cfg: Arc<Config>,
     connections: u64,
     latency: Arc<Stats>,
     requests_stats: Arc<Stats>,
-    counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
     tls: Option<tokio_rustls::TlsConnector>,
     server_name: Option<rustls::pki_types::ServerName<'static>>,
-) {
-    let runtime = match Runtime::new() {
+) -> CounterSnapshot {
+    let runtime = match worker_runtime() {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return CounterSnapshot::default(),
     };
     let local = LocalSet::new();
+
+    // This worker's own counters — never shared with other workers, so the
+    // connection tasks' relaxed `fetch_add`s stay on one core (no cacheline
+    // bounce). See the comment on `Counters`.
+    let counters = Arc::new(Counters::default());
 
     // Per-worker rate counter, mirroring wrk's thread-local thread->requests.
     // Connection tasks bump this; the rate recorder samples+resets it every
     // 100ms. Not shared across workers, so no cross-worker swap contention.
     let rate_counter = Arc::new(AtomicU64::new(0));
 
+    let counters_handle = counters.clone();
     local.block_on(&runtime, async move {
         // Spawn one task per connection.
         for _ in 0..connections {
@@ -66,6 +83,8 @@ pub fn run_worker(
 
         run_rate_recorder(&rate_counter, &requests_stats, &stop).await;
     });
+
+    counters_handle.snapshot()
 }
 
 /// HTTP/3 variant: each worker opens `connections` QUIC connections, each with
@@ -77,18 +96,19 @@ pub fn run_h3_worker(
     connections: u64,
     latency: Arc<Stats>,
     requests_stats: Arc<Stats>,
-    counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
     endpoint: Arc<Endpoint>,
-) {
-    let runtime = match Runtime::new() {
+) -> CounterSnapshot {
+    let runtime = match worker_runtime() {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return CounterSnapshot::default(),
     };
     let local = LocalSet::new();
 
+    let counters = Arc::new(Counters::default());
     let rate_counter = Arc::new(AtomicU64::new(0));
 
+    let counters_handle = counters.clone();
     local.block_on(&runtime, async move {
         for _ in 0..connections {
             let cfg = cfg.clone();
@@ -104,6 +124,8 @@ pub fn run_h3_worker(
 
         run_rate_recorder(&rate_counter, &requests_stats, &stop).await;
     });
+
+    counters_handle.snapshot()
 }
 
 /// HTTP/2 variant: each worker opens `connections` TLS connections, each with
@@ -115,19 +137,20 @@ pub fn run_h2_worker(
     connections: u64,
     latency: Arc<Stats>,
     requests_stats: Arc<Stats>,
-    counters: Arc<Counters>,
     stop: Arc<AtomicBool>,
     tls: tokio_rustls::TlsConnector,
     server_name: rustls::pki_types::ServerName<'static>,
-) {
-    let runtime = match Runtime::new() {
+) -> CounterSnapshot {
+    let runtime = match worker_runtime() {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return CounterSnapshot::default(),
     };
     let local = LocalSet::new();
 
+    let counters = Arc::new(Counters::default());
     let rate_counter = Arc::new(AtomicU64::new(0));
 
+    let counters_handle = counters.clone();
     local.block_on(&runtime, async move {
         for _ in 0..connections {
             let cfg = cfg.clone();
@@ -147,6 +170,8 @@ pub fn run_h2_worker(
 
         run_rate_recorder(&rate_counter, &requests_stats, &stop).await;
     });
+
+    counters_handle.snapshot()
 }
 
 /// Shared 100ms rate recorder loop. Mirrors wrk's record_rate (wrk.c:273):

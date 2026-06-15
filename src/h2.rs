@@ -157,9 +157,12 @@ async fn run_h2_stream(
             }
         };
         let status = resp.status().as_u16();
-        // Drain the body; bytes are counted by CountingStream at the TLS layer.
-        use http_body_util::BodyExt;
-        if resp.into_body().collect().await.is_err() {
+        // Drain the body frame-by-frame (zero-alloc). Bytes are counted by
+        // CountingStream at the TLS layer, so we just drop each frame. This
+        // replaces an earlier `BodyExt::collect` that buffered the whole
+        // response into a `Bytes` and then threw it away — pure waste per
+        // request on the H2 hot path.
+        if crate::connection::drain_body(resp.into_body()).await.is_err() {
             counters.errors_read.fetch_add(1, Ordering::Relaxed);
             return;
         }

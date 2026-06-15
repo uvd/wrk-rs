@@ -27,9 +27,14 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 use crate::config::{Config, Scheme};
 use crate::counting::CountingStream;
 
-/// Counters shared across a worker's connections (and aggregated globally).
-/// Note: the per-100ms rate counter is kept per-worker in worker.rs, not here
-/// (see the comment in worker.rs for why).
+/// Counters accumulated by a single worker's connections. Each worker owns its
+/// own instance (passed by `Arc` to that worker's connection tasks); main sums
+/// them after join. Keeping these per-worker — instead of one global
+/// `Arc<Counters>` hit by every connection on every core — removes the
+/// contended-atomic cacheline bounce that was the dominant per-request cost at
+/// high `-t`. On a single core an uncontended relaxed `fetch_add` is ~1ns, so
+/// sharing within a worker costs nothing; only *cross-core* sharing is
+/// expensive, and we no longer do that.
 #[derive(Default)]
 pub struct Counters {
     pub complete: AtomicU64,
@@ -39,6 +44,51 @@ pub struct Counters {
     pub errors_write: AtomicU64,
     pub errors_status: AtomicU64,
     pub errors_timeout: AtomicU64,
+}
+
+/// A point-in-time snapshot of a worker's counters, taken once the worker
+/// finishes. Cheap to sum across workers (plain integer adds, no atomics).
+#[derive(Default, Clone, Copy)]
+pub struct CounterSnapshot {
+    pub complete: u64,
+    pub bytes: u64,
+    pub errors_connect: u64,
+    pub errors_read: u64,
+    pub errors_write: u64,
+    pub errors_status: u64,
+    pub errors_timeout: u64,
+}
+
+impl CounterSnapshot {
+    /// Sum a slice of per-worker snapshots into one aggregate.
+    pub fn sum(snapshots: &[CounterSnapshot]) -> CounterSnapshot {
+        let mut t = CounterSnapshot::default();
+        for s in snapshots {
+            t.complete += s.complete;
+            t.bytes += s.bytes;
+            t.errors_connect += s.errors_connect;
+            t.errors_read += s.errors_read;
+            t.errors_write += s.errors_write;
+            t.errors_status += s.errors_status;
+            t.errors_timeout += s.errors_timeout;
+        }
+        t
+    }
+}
+
+impl Counters {
+    /// Relaxed load every field once. Called once per worker at join time.
+    pub fn snapshot(&self) -> CounterSnapshot {
+        CounterSnapshot {
+            complete: self.complete.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            errors_connect: self.errors_connect.load(Ordering::Relaxed),
+            errors_read: self.errors_read.load(Ordering::Relaxed),
+            errors_write: self.errors_write.load(Ordering::Relaxed),
+            errors_status: self.errors_status.load(Ordering::Relaxed),
+            errors_timeout: self.errors_timeout.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// A transport: either a plain TCP stream or a TLS-over-TCP stream.
@@ -103,8 +153,8 @@ impl tokio::io::AsyncWrite for Transport {
 /// A Future that drains a body frame-by-frame, dropping each frame without
 /// collecting — zero allocation per response. Bytes are already counted
 /// upstream by CountingStream. Registers the waker correctly so it never
-/// busy-loops.
-struct DrainBody<B> {
+/// busy-loops. Shared by the HTTP/1 and HTTP/2 paths.
+pub(crate) struct DrainBody<B> {
     body: B,
 }
 
@@ -122,6 +172,13 @@ impl<B: Body + Unpin> Future for DrainBody<B> {
             }
         }
     }
+}
+
+/// Construct a draining future over a body. `pub(crate)` so the H2 path reuses
+/// the same zero-alloc drain instead of `BodyExt::collect` (which buffers the
+/// entire response body into a `Bytes` and then drops it).
+pub(crate) fn drain_body<B: Body + Unpin>(body: B) -> DrainBody<B> {
+    DrainBody { body }
 }
 
 #[allow(dead_code)]
@@ -241,7 +298,7 @@ pub async fn run_connection(
             };
             let status = resp.status().as_u16();
             // Zero-alloc drain: drop frames one at a time; bytes already counted.
-            let mut drain = DrainBody { body: resp.into_body() };
+            let mut drain = drain_body(resp.into_body());
             if (&mut drain).await.is_err() {
                 counters.errors_read.fetch_add(1, Ordering::Relaxed);
                 break;
