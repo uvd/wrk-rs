@@ -172,6 +172,13 @@ pub async fn run_connection(
     }
     let body_len = body_bytes.len();
 
+    // Pre-build a full request template once per connection. Cloning it per
+    // request is far cheaper than rebuilding the HeaderMap entry-by-entry:
+    // HeaderName/HeaderValue are Bytes-backed (atomic-inc only), Full<Bytes>
+    // is Copy, and the method/URI are cheap to clone. This is the biggest
+    // per-request allocation win.
+    let req_template: http::Request<Full<Bytes>> = build_request(&method, &cfg.path, &static_headers, body_bytes.clone());
+
     while !stop.load(Ordering::Relaxed) {
         // ---- connect ----
         let transport = match connect(&cfg, tls.clone(), server_name.clone()).await {
@@ -205,70 +212,63 @@ pub async fn run_connection(
         });
 
         // ---- request/response loop on this connection ----
+        //
+        // Hot-path design notes:
+        //  - No per-request `tokio::time::timeout` wrapper. The Sleep future
+        //    it allocates/registers/deregisters is the single biggest per-
+        //    request cost on fast servers. Instead we stamp start time and
+        //    only treat a request as timed-out if it actually overshoots the
+        //    deadline (rare on a healthy server).
+        //  - Request is cloned from a template (cheap Bytes refcount incs).
+        //  - `Instant::now()` is taken once per request (not twice).
+        //  - Counters use relaxed ordering throughout.
         loop {
             if stop.load(Ordering::Relaxed) {
                 return;
             }
 
-            let req = build_request(&method, &cfg.path, &static_headers, body_bytes.clone());
+            let req = req_template.clone();
 
             let start = Instant::now();
             rate_counter.fetch_add(1, Ordering::Relaxed);
 
-            // One timeout bounds the whole request+response+drain.
-            let outcome =
-                tokio::time::timeout(timeout_dur, request_response(&mut sender, req)).await;
-
-            let status = match outcome {
-                Ok(Ok(status)) => status,
-                Ok(Err(())) => {
+            let resp = match sender.send_request(req).await {
+                Ok(r) => r,
+                Err(_) => {
                     counters.errors_write.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
-                Err(_) => {
-                    counters.errors_timeout.fetch_add(1, Ordering::Relaxed);
-                    break;
-                }
             };
+            let status = resp.status().as_u16();
+            // Zero-alloc drain: drop frames one at a time; bytes already counted.
+            let mut drain = DrainBody { body: resp.into_body() };
+            if (&mut drain).await.is_err() {
+                counters.errors_read.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
 
-            let elapsed_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            let elapsed = start.elapsed();
+            let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
+
             counters.complete.fetch_add(1, Ordering::Relaxed);
             if status > 399 {
                 counters.errors_status.fetch_add(1, Ordering::Relaxed);
+            }
+            if elapsed > timeout_dur {
+                // Request exceeded the timeout — count it and reconnect.
+                counters.errors_timeout.fetch_add(1, Ordering::Relaxed);
+                break;
             }
             if !latency.record(elapsed_us) {
                 counters.errors_timeout.fetch_add(1, Ordering::Relaxed);
             }
             let b = bytes_read.swap(0, Ordering::Relaxed);
             counters.bytes.fetch_add(b, Ordering::Relaxed);
-
-            // Loop back to send_request; send_request internally awaits
-            // readiness if the connection isn't ready, so we don't need a
-            // separate ready() probe (which would add an extra await per
-            // request). A failed send on the next iteration is caught by the
-            // error branch above and triggers a reconnect.
         }
     }
 
     // Reference unused vars to keep them in scope for clarity.
     let _ = body_len;
-}
-
-/// Send one request and drain its response body without allocating (bytes are
-/// already counted by CountingStream). Returns the HTTP status code.
-async fn request_response(
-    sender: &mut http1::SendRequest<Full<Bytes>>,
-    req: http::Request<Full<Bytes>>,
-) -> Result<u16, ()> {
-    let resp = sender.send_request(req).await.map_err(|_| ())?;
-    let status = resp.status().as_u16();
-    // Zero-alloc drain: drop frames one at a time; bytes already counted.
-    DrainBody {
-        body: resp.into_body(),
-    }
-    .await
-    .map_err(|_| ())?;
-    Ok(status)
 }
 
 fn build_request(

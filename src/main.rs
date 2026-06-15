@@ -11,6 +11,7 @@
 mod config;
 mod connection;
 mod counting;
+mod h2;
 mod h3;
 mod report;
 mod stats;
@@ -99,9 +100,36 @@ fn main() {
                 }));
             }
         }
+        config::ResolvedVersion::Http2 => {
+            // Build a TLS connector + server name (HTTP/2 runs over TLS here).
+            let (tls, server_name) = build_tls(&cfg, resolved);
+            let tls = tls.expect("HTTP/2 requires TLS");
+            let server_name = server_name.expect("HTTP/2 requires a server name");
+            for _ in 0..cfg.threads {
+                let cfg = cfg.clone();
+                let latency = latency.clone();
+                let requests_stats = requests_stats.clone();
+                let counters = counters.clone();
+                let stop = stop.clone();
+                let tls = tls.clone();
+                let server_name = server_name.clone();
+                handles.push(std::thread::spawn(move || {
+                    worker::run_h2_worker(
+                        cfg,
+                        per_thread,
+                        latency,
+                        requests_stats,
+                        counters,
+                        stop,
+                        tls,
+                        server_name,
+                    );
+                }));
+            }
+        }
         config::ResolvedVersion::Http1 => {
             // Build a TLS connector + server name once, if needed.
-            let (tls, server_name) = build_tls(&cfg);
+            let (tls, server_name) = build_tls(&cfg, resolved);
             for _ in 0..cfg.threads {
                 let cfg = cfg.clone();
                 let latency = latency.clone();
@@ -164,26 +192,33 @@ fn main() {
     let _ = exit;
 }
 
-/// Resolve the effective protocol version, probing QUIC for Auto+https.
+/// Resolve the effective protocol version. For Auto+https, probe in priority
+/// order: HTTP/3 (QUIC) → HTTP/2 (TLS ALPN) → HTTP/1.1.
 fn resolve_protocol(cfg: &config::Config) -> config::ResolvedVersion {
     use config::{HttpVersion, ResolvedVersion, Scheme};
     match cfg.http_version {
         HttpVersion::Http1 => ResolvedVersion::Http1,
+        HttpVersion::Http2 => ResolvedVersion::Http2,
         HttpVersion::Http3 => ResolvedVersion::Http3,
         HttpVersion::Auto => {
-            if cfg.scheme == Scheme::Https {
-                // Probe: open a throwaway tokio runtime, try a QUIC handshake
-                // with a short timeout. Success ⇒ HTTP/3, failure ⇒ HTTP/1.1.
-                let probe_ok = probe_quic(cfg);
-                if probe_ok {
-                    eprintln!("Negotiated HTTP/3 (QUIC)");
-                    ResolvedVersion::Http3
-                } else {
-                    eprintln!("HTTP/3 unavailable, falling back to HTTP/1.1");
+            if cfg.scheme != Scheme::Https {
+                return ResolvedVersion::Http1;
+            }
+            // 1. Try HTTP/3 (QUIC).
+            if probe_quic(cfg) {
+                eprintln!("Negotiated HTTP/3 (QUIC)");
+                return ResolvedVersion::Http3;
+            }
+            // 2. Try HTTP/2 via TLS ALPN.
+            match probe_alpn(cfg) {
+                Some("h2") => {
+                    eprintln!("Negotiated HTTP/2");
+                    ResolvedVersion::Http2
+                }
+                _ => {
+                    eprintln!("Falling back to HTTP/1.1");
                     ResolvedVersion::Http1
                 }
-            } else {
-                ResolvedVersion::Http1
             }
         }
     }
@@ -223,13 +258,68 @@ fn probe_quic(cfg: &config::Config) -> bool {
     })
 }
 
+/// Attempt a TLS handshake to the target, advertising both h2 and http/1.1,
+/// and return the negotiated ALPN protocol. Used for auto-negotiation.
+fn probe_alpn(cfg: &config::Config) -> Option<&'static str> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    runtime.block_on(async {
+        // Build a TLS config that advertises h2 + http/1.1.
+        let mut roots = rustls::RootCertStore::empty();
+        if cfg.insecure {
+            // For --insecure, use the no-verifier path; ALPN still works.
+        } else {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+        let mut client_crypto = if cfg.insecure {
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth()
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        };
+        client_crypto.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_crypto));
+        let tcp = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::net::TcpStream::connect((cfg.host.as_str(), cfg.port)),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let server_name = rustls::pki_types::ServerName::try_from(cfg.host.clone()).ok()?;
+        let tls = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            connector.connect(server_name, tcp),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let alpn = tls.get_ref().1.alpn_protocol();
+        match alpn {
+            Some(b"h2") => Some("h2"),
+            Some(b"http/1.1") => Some("http/1.1"),
+            _ => None,
+        }
+    })
+}
+
 /// Print the "Running ..." header, annotated with the resolved protocol.
 fn print_run_header(cfg: &config::Config, time: &str) {
     let proto = cfg
         .resolved
         .map(|r| r.as_str())
         .unwrap_or("HTTP/1.1");
-    let streams = if cfg.resolved == Some(config::ResolvedVersion::Http3) {
+    let streams = if matches!(
+        cfg.resolved,
+        Some(config::ResolvedVersion::Http3) | Some(config::ResolvedVersion::Http2)
+    ) {
         format!(", {} streams/conn", cfg.streams_per_conn)
     } else {
         String::new()
@@ -243,6 +333,7 @@ fn print_run_header(cfg: &config::Config, time: &str) {
 
 fn build_tls(
     cfg: &Config,
+    resolved: config::ResolvedVersion,
 ) -> (
     Option<tokio_rustls::TlsConnector>,
     Option<rustls::pki_types::ServerName<'static>>,
@@ -254,7 +345,7 @@ fn build_tls(
     // requires an explicit CryptoProvider choice).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let config = if cfg.insecure {
+    let mut config = if cfg.insecure {
         // Mirror wrk's SSL_VERIFY_NONE: accept any certificate.
         rustls::ClientConfig::builder()
             .dangerous()
@@ -266,6 +357,12 @@ fn build_tls(
         rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth()
+    };
+    // Advertise the matching ALPN so the server negotiates the right protocol.
+    config.alpn_protocols = match resolved {
+        config::ResolvedVersion::Http2 => vec![b"h2".to_vec()],
+        config::ResolvedVersion::Http1 => vec![b"http/1.1".to_vec()],
+        _ => vec![],
     };
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let server_name: rustls::pki_types::ServerName<'static> =

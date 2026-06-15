@@ -2,7 +2,7 @@
 
 A modern HTTP benchmarking tool — a pure-Rust reimplementation of
 [wrk](https://github.com/wg/wrk), built on **tokio** + **hyper** + **rustls**,
-with **HTTP/3 (QUIC)** support via **quinn** + **h3**.
+with **HTTP/2** and **HTTP/3 (QUIC)** support.
 
 The command-line interface, benchmarking behaviour, statistics, and output
 format are **byte-for-byte compatible** with the original `wrk`. Lua scripting
@@ -22,11 +22,12 @@ is replaced by built-in flags (`-X`/`--method`, `--path`, `-b`/`--body`).
 
 ## Features
 
-- HTTP, HTTPS, and **HTTP/3** benchmarking (TLS via rustls, QUIC via quinn/h3)
-- **Protocol negotiation**: `https://` auto-detects HTTP/3 and falls back to
-  HTTP/1.1 silently; force either with `--http http3` / `--http http1` / `--http3`
-- **HTTP/3 multiplexing**: one QUIC connection carries multiple concurrent
-  streams (`--streams N`), HTTP/3's core advantage over HTTP/1.1
+- HTTP, HTTPS, **HTTP/2**, and **HTTP/3** benchmarking (TLS via rustls, QUIC
+  via quinn/h3)
+- **Protocol negotiation**: `https://` auto-detects the best protocol in
+  priority order HTTP/3 → HTTP/2 → HTTP/1.1; force any with `--http`
+- **HTTP/2 & HTTP/3 multiplexing**: one connection carries multiple concurrent
+  streams (`--streams N`), eliminating head-of-line blocking
 - Multithreaded — one OS thread per `-t`, each running a current-thread tokio
   runtime (mirrors wrk's per-thread event loop)
 - Fixed connection count with automatic reconnect on error
@@ -107,9 +108,10 @@ Usage: wrk <options> <url>
     -X, --method   <METH>  HTTP method (default GET)
         --path         <P>  Request path (default /)
     -b, --body        <B>  Request body
-        --http <VER>       auto | http1 | http3
+        --http <VER>       auto | http1 | http2 | http3
+        --http2            Force HTTP/2
         --http3            Force HTTP/3 over QUIC
-        --streams <N>      Concurrent streams (HTTP/3)
+        --streams <N>      Concurrent streams (HTTP/2, HTTP/3)
     -v, --version          Print version details
 
   Numeric arguments may include a SI unit (1k, 1M, 1G)
@@ -178,35 +180,43 @@ wrk -T5s http://...          # 5 second timeout
 - `--http3` / `--http http3` requires an `https://` URL (QUIC is TLS-only).
 - `--streams` must be ≥ 1.
 
-## Choosing the protocol (HTTP/3)
+## Choosing the protocol (HTTP/2 / HTTP/3)
 
 | Flag | Behaviour |
 |---|---|
-| *(default)* `--http auto` | `https://` → probe QUIC (1s), use HTTP/3 if available else HTTP/1.1; `http://` → HTTP/1.1 |
+| *(default)* `--http auto` | `https://` → negotiate HTTP/3 → HTTP/2 → HTTP/1.1 (in priority order); `http://` → HTTP/1.1 |
 | `--http http1` | always HTTP/1.1, even for `https://` |
+| `--http http2` | always HTTP/2 (requires `https://`) |
+| `--http2` | shorthand for `--http http2` |
 | `--http http3` | always HTTP/3 (requires `https://`) |
 | `--http3` | shorthand for `--http http3` |
-| `--streams <N>` | concurrent streams per QUIC connection (HTTP/3 only) |
+| `--streams <N>` | concurrent streams per connection (HTTP/2 and HTTP/3) |
 
 ### How auto-negotiation works
 
-For an `https://` URL with `--http auto` (the default), wrk-rs opens a throwaway
-QUIC handshake to the server with a 1-second budget:
+For an `https://` URL with `--http auto` (the default), wrk-rs probes in
+priority order:
 
-- **Success** → run HTTP/3, print `Negotiated HTTP/3 (QUIC)`
-- **Failure** → fall back to HTTP/1.1, print `HTTP/3 unavailable, falling back to HTTP/1.1`
+1. **HTTP/3** — opens a QUIC handshake (1s budget). Success → HTTP/3.
+2. **HTTP/2** — performs a TLS handshake advertising `h2`+`http/1.1` via ALPN;
+   if the server picks `h2` → HTTP/2.
+3. **HTTP/1.1** — fallback.
 
-The actual protocol used is shown in the report's `[...]` annotation.
+Each step prints what it negotiated (e.g. `Negotiated HTTP/2`). The actual
+protocol is also shown in the report's `[...]` annotation.
 
-### HTTP/3 connection model
+### Multiplexing (HTTP/2 & HTTP/3)
 
-For HTTP/3, `-c` is the number of QUIC connections and `--streams` is the
-concurrent stream count per connection. The total number of in-flight requests
-is `-c × --streams`. This leverages HTTP/3's multiplexing: many streams share
-one connection without head-of-line blocking.
+HTTP/2 and HTTP/3 multiplex many streams over one connection, avoiding the
+head-of-line blocking that limits HTTP/1.1. For these protocols, `-c` is the
+number of connections and `--streams` is the concurrent stream count per
+connection, so total in-flight requests is `-c × --streams`.
 
 ```sh
-# 10 QUIC connections × 20 streams = 200 concurrent requests
+# 10 connections × 20 streams = 200 concurrent requests over HTTP/2
+wrk --http2 --streams 20 -t4 -c10 -d10s https://example.com/
+
+# Same idea over HTTP/3
 wrk --http3 --streams 20 -t4 -c10 -d10s https://example.com/
 ```
 
@@ -277,11 +287,17 @@ wrk -t4 -c100 -d30s -L https://example.com/
 wrk -t4 -c100 -d30s --insecure https://127.0.0.1:8443/
 ```
 
-### Auto-negotiate HTTP/3 (the default for https)
+### Auto-negotiate the best protocol (the default for https)
 
 ```sh
-# Tries HTTP/3 first; falls back to HTTP/1.1 if the server doesn't speak QUIC.
+# Tries HTTP/3 → HTTP/2 → HTTP/1.1 in order and uses the best available.
 wrk -t4 -c100 -d30s https://cloudflare.com/
+```
+
+### Force HTTP/2
+
+```sh
+wrk --http2 --insecure -t2 -c10 --streams 20 -d10s https://127.0.0.1:18444/
 ```
 
 ### Force HTTP/3
@@ -325,13 +341,16 @@ histogram.
 
 ## Local test servers
 
-Two example servers are included for benchmarking (in `examples/`):
+Three example servers are included for benchmarking (in `examples/`):
 
 ```sh
 # HTTP/1.1 server on port 18081 (plain TCP, fast)
 cargo run --release --example bench_server
 
-# HTTP/3 server on port 18443 (self-signed cert — use --insecure)
+# HTTP/2 server on port 18444 (TLS + h2 via ALPN, self-signed cert — use --insecure)
+cargo run --release --example bench_h2_server
+
+# HTTP/3 server on port 18443 (QUIC, self-signed cert — use --insecure)
 cargo run --release --example bench_h3_server
 ```
 
@@ -340,6 +359,9 @@ Then point wrk-rs at them:
 ```sh
 # HTTP/1.1
 wrk -t2 -c50 -d5s http://127.0.0.1:18081/
+
+# HTTP/2 (self-signed)
+wrk --http2 --insecure -t2 -c10 --streams 10 -d5s https://127.0.0.1:18444/
 
 # HTTP/3 (self-signed)
 wrk --http3 --insecure -t2 -c10 --streams 10 -d5s https://127.0.0.1:18443/
@@ -352,11 +374,12 @@ wrk --http3 --insecure -t2 -c10 --streams 10 -d5s https://127.0.0.1:18443/
 | Language | C | Rust |
 | I/O model | Redis `ae` event loop (epoll/kqueue) | tokio async/await |
 | HTTP/1 | vendored joyent http-parser | hyper 1.x |
+| HTTP/2 | — | hyper 1.x (h2) |
 | HTTP/3 | — | quinn + h3 |
 | TLS | OpenSSL | rustls |
 | Scripting | LuaJIT (`-s`) | not supported; use `-X`/`--path`/`-b` instead |
 | Cert verification | none (`SSL_VERIFY_NONE`) | verified by default; `--insecure` to disable |
-| Protocol selection | — | `--http auto/http1/http3` with auto-negotiation |
+| Protocol selection | — | `--http auto/http1/http2/http3` with auto-negotiation |
 | Output format | — | **identical** (plus a `[protocol]` annotation) |
 
 The CLI flags `-c`/`-d`/`-t`/`-H`/`-L`/`-T`/`-v`/`-h` are unchanged from the

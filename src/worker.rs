@@ -106,6 +106,49 @@ pub fn run_h3_worker(
     });
 }
 
+/// HTTP/2 variant: each worker opens `connections` TLS connections, each with
+/// `streams_per_conn` concurrent multiplexed streams. Same bookkeeping as the
+/// other workers.
+#[allow(clippy::too_many_arguments)]
+pub fn run_h2_worker(
+    cfg: Arc<Config>,
+    connections: u64,
+    latency: Arc<Stats>,
+    requests_stats: Arc<Stats>,
+    counters: Arc<Counters>,
+    stop: Arc<AtomicBool>,
+    tls: tokio_rustls::TlsConnector,
+    server_name: rustls::pki_types::ServerName<'static>,
+) {
+    let runtime = match Runtime::new() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let local = LocalSet::new();
+
+    let rate_counter = Arc::new(AtomicU64::new(0));
+
+    local.block_on(&runtime, async move {
+        for _ in 0..connections {
+            let cfg = cfg.clone();
+            let counters = counters.clone();
+            let latency = latency.clone();
+            let stop = stop.clone();
+            let tls = tls.clone();
+            let server_name = server_name.clone();
+            let rate_counter = rate_counter.clone();
+            tokio::task::spawn_local(async move {
+                crate::h2::run_h2_connection(
+                    cfg, counters, latency, stop, tls, server_name, rate_counter,
+                )
+                .await;
+            });
+        }
+
+        run_rate_recorder(&rate_counter, &requests_stats, &stop).await;
+    });
+}
+
 /// Shared 100ms rate recorder loop. Mirrors wrk's record_rate (wrk.c:273):
 /// every tick, convert this worker's request count into req/s and record it.
 async fn run_rate_recorder(

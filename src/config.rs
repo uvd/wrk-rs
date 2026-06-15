@@ -30,10 +30,12 @@ pub enum Scheme {
 pub enum HttpVersion {
     /// HTTP/1.1 (over TCP, or over TLS for https).
     Http1,
+    /// HTTP/2 (multiplexed over a single TLS connection).
+    Http2,
     /// HTTP/3 over QUIC. Forces QUIC transport regardless of scheme.
     Http3,
-    /// Negotiate: for https, try HTTP/3 and fall back to HTTP/1.1 on failure.
-    /// For plain http, always uses HTTP/1.1.
+    /// Negotiate: for https, try HTTP/3 → HTTP/2 → HTTP/1.1 in order;
+    /// for plain http, always uses HTTP/1.1.
     #[default]
     Auto,
 }
@@ -42,6 +44,7 @@ pub enum HttpVersion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolvedVersion {
     Http1,
+    Http2,
     Http3,
 }
 
@@ -49,6 +52,7 @@ impl ResolvedVersion {
     pub fn as_str(&self) -> &'static str {
         match self {
             ResolvedVersion::Http1 => "HTTP/1.1",
+            ResolvedVersion::Http2 => "HTTP/2",
             ResolvedVersion::Http3 => "HTTP/3",
         }
     }
@@ -178,10 +182,12 @@ impl MethodArg {
 /// CLI-facing HTTP version selector.
 #[derive(Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub enum VersionArg {
-    /// Negotiate: https tries HTTP/3 and falls back to HTTP/1.1; http is HTTP/1.1.
+    /// Negotiate: https tries HTTP/3 → HTTP/2 → HTTP/1.1; http is HTTP/1.1.
     Auto,
     /// HTTP/1.1.
     Http1,
+    /// HTTP/2 (multiplexed).
+    Http2,
     /// HTTP/3 over QUIC.
     Http3,
 }
@@ -191,6 +197,7 @@ impl VersionArg {
         match self {
             VersionArg::Auto => HttpVersion::Auto,
             VersionArg::Http1 => HttpVersion::Http1,
+            VersionArg::Http2 => HttpVersion::Http2,
             VersionArg::Http3 => HttpVersion::Http3,
         }
     }
@@ -246,15 +253,19 @@ pub struct Cli {
     #[arg(short = 'b', long = "body", value_name = "BODY")]
     body: Option<String>,
 
-    /// HTTP protocol version: auto (negotiate), http1, or http3
+    /// HTTP protocol version: auto (negotiate), http1, http2, or http3
     #[arg(long = "http", value_name = "VER", default_value = "auto")]
     http_version: VersionArg,
+
+    /// Force HTTP/2 (shorthand for --http http2)
+    #[arg(long = "http2", action = ArgAction::SetTrue)]
+    http2: bool,
 
     /// Force HTTP/3 over QUIC (shorthand for --http http3)
     #[arg(long = "http3", action = ArgAction::SetTrue)]
     http3: bool,
 
-    /// Concurrent streams per connection (HTTP/3 only)
+    /// Concurrent streams per connection (HTTP/2 and HTTP/3)
     #[arg(long = "streams", value_name = "N", default_value = "1")]
     streams_per_conn: MetricArg,
 
@@ -289,7 +300,8 @@ pub fn print_usage() {
          \x20     -X, --method   <METH>  HTTP method (default GET)  \n\
          \x20         --path         <P>  Request path (default /)  \n\
          \x20     -b, --body        <B>  Request body               \n\
-         \x20         --http <VER>       auto | http1 | http3        \n\
+         \x20         --http <VER>       auto | http1 | http2 | http3 \n\
+         \x20         --http2            Force HTTP/2                \n\
          \x20         --http3            Force HTTP/3 over QUIC      \n\
          \x20         --streams <N>      Concurrent streams (HTTP/3) \n\
          \x20     -v, --version          Print version details      \n\
@@ -351,9 +363,11 @@ pub fn parse_args() -> Config {
     let body = cli.body.map(|s| s.into_bytes()).unwrap_or_default();
     let headers: Vec<(String, String)> = cli.header.into_iter().map(|h| (h.0, h.1)).collect();
 
-    // Protocol selection. --http3 is a shorthand that forces http3.
+    // Protocol selection. --http3 / --http2 are shorthands that override --http.
     let http_version = if cli.http3 {
         HttpVersion::Http3
+    } else if cli.http2 {
+        HttpVersion::Http2
     } else {
         cli.http_version.to_http_version()
     };
@@ -381,9 +395,12 @@ pub fn parse_args() -> Config {
         }
     };
 
-    // HTTP/3 requires QUIC/UDP, which only makes sense for https:// targets.
-    if matches!(http_version, HttpVersion::Http3) && scheme == Scheme::Http {
-        eprintln!("--http3 / --http http3 requires an https:// URL");
+    // HTTP/3 requires QUIC/UDP (https only); HTTP/2 here runs over TLS
+    // (https only). Plain http:// is always HTTP/1.1.
+    if matches!(http_version, HttpVersion::Http3 | HttpVersion::Http2)
+        && scheme == Scheme::Http
+    {
+        eprintln!("--http2 / --http3 requires an https:// URL");
         exit(1);
     }
 

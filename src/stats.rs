@@ -45,6 +45,11 @@ impl Stats {
     /// Record a sample. Returns `false` (and records nothing) if `n >= limit`,
     /// which the caller treats as a timeout. Atomically increments `data[n]`
     /// and `count`, and CAS-updates `min`/`max`.
+    ///
+    /// Hot path: after warmup, `min`/`max` converge and the vast majority of
+    /// samples fall inside `[min, max]`, so both CAS loops are skipped with a
+    /// single relaxed load each. The two `fetch_add`s remain (unavoidable for a
+    /// thread-safe histogram), but use relaxed ordering.
     pub fn record(&self, n: u64) -> bool {
         if n >= self.limit {
             return false;
@@ -52,30 +57,43 @@ impl Stats {
         self.data[n as usize].fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
 
-        // CAS-update min
-        let mut cur_min = self.min.load(Ordering::Relaxed);
-        while n < cur_min {
-            match self.min.compare_exchange_weak(
-                cur_min,
-                n,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => cur_min = actual,
+        // Fast path: if n is within the current [min, max] window, neither
+        // bound needs updating — skip the CAS loops entirely.
+        let cur_min = self.min.load(Ordering::Relaxed);
+        let cur_max = self.max.load(Ordering::Relaxed);
+        if n >= cur_min && n <= cur_max {
+            return true;
+        }
+
+        // Slow path: n extends the window. Update whichever bound(s) need it
+        // (both may need updating on the very first record). These are
+        // independent CAS loops, not if/else.
+        if n < cur_min {
+            let mut m = cur_min;
+            while n < m {
+                match self.min.compare_exchange_weak(
+                    m,
+                    n,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => m = actual,
+                }
             }
         }
-        // CAS-update max
-        let mut cur_max = self.max.load(Ordering::Relaxed);
-        while n > cur_max {
-            match self.max.compare_exchange_weak(
-                cur_max,
-                n,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => cur_max = actual,
+        if n > cur_max {
+            let mut m = cur_max;
+            while n > m {
+                match self.max.compare_exchange_weak(
+                    m,
+                    n,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => m = actual,
+                }
             }
         }
         true

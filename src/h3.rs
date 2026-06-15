@@ -145,28 +145,25 @@ pub async fn run_h3_connection(
             let _ = drive_stop;
         });
 
-        // Spawn `streams_per_conn` concurrent stream-tasks.
+        // Spawn `streams_per_conn` concurrent stream-tasks. Build the request
+        // template once; stream tasks clone it per request (cheap — Request<()>
+        // and HeaderMap are Bytes-backed).
+        let req_template = build_h3_request(&method, &full_uri, &static_headers, &body_bytes);
         let mut stream_handles = Vec::new();
         for _ in 0..cfg.streams_per_conn {
             let counters = counters.clone();
             let latency = latency.clone();
             let stop = stop.clone();
             let send_request = send_request.clone();
-            let static_headers = static_headers.clone();
-            let body_bytes = body_bytes.clone();
-            let method = method.clone();
             let rate_counter = rate_counter.clone();
-            let full_uri = full_uri.clone();
+            let req_template = req_template.clone();
             stream_handles.push(tokio::spawn(run_h3_stream(
                 counters,
                 latency,
                 stop,
                 send_request,
-                static_headers,
-                body_bytes,
-                method,
+                req_template,
                 rate_counter,
-                full_uri,
                 timeout_dur,
             )));
         }
@@ -186,12 +183,9 @@ async fn run_h3_stream<B>(
     counters: Arc<Counters>,
     latency: Arc<crate::stats::Stats>,
     stop: Arc<AtomicBool>,
-    send_request: SendRequest<B, Bytes>,
-    static_headers: Arc<http::HeaderMap>,
-    body_bytes: Bytes,
-    method: http::Method,
+    mut send_request: SendRequest<B, Bytes>,
+    req_template: http::Request<()>,
     rate_counter: Arc<AtomicU64>,
-    full_uri: http::Uri,
     timeout_dur: Duration,
 )
 // The OpenStreams bound comes from h3's SendRequest generics; using a concrete
@@ -199,43 +193,33 @@ async fn run_h3_stream<B>(
 where
     B: OpenStreams<Bytes> + Clone + Send + Sync + 'static,
 {
-    let mut send_request = send_request;
-
     while !stop.load(Ordering::Relaxed) {
-        let req = build_h3_request(&method, &full_uri, &static_headers, &body_bytes);
+        let req = req_template.clone();
 
         let start = Instant::now();
         rate_counter.fetch_add(1, Ordering::Relaxed);
 
-        // send_request opens a new bidirectional stream; then we drive the
-        // exchange with a per-request timeout.
-        let outcome = tokio::time::timeout(
-            timeout_dur,
-            h3_request_response(&mut send_request, req),
-        )
-        .await;
-
-        let (status, body_bytes_recv) = match outcome {
-            Ok(Ok(v)) => v,
-            Ok(Err(H3ExchangeError::Send)) => {
+        let (status, body_bytes_recv) = match h3_request_response(&mut send_request, req).await {
+            Ok(v) => v,
+            Err(H3ExchangeError::Send) => {
                 counters.errors_write.fetch_add(1, Ordering::Relaxed);
                 return; // connection is broken; the connection task will reconnect
             }
-            Ok(Err(H3ExchangeError::Recv)) => {
+            Err(H3ExchangeError::Recv) => {
                 counters.errors_read.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            Err(_) => {
-                counters.errors_timeout.fetch_add(1, Ordering::Relaxed);
-                // A timeout on one stream need not kill the connection.
-                continue;
-            }
         };
 
-        let elapsed_us = start.elapsed().as_micros().min(u64::MAX as u128) as u64;
+        let elapsed = start.elapsed();
+        let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
         counters.complete.fetch_add(1, Ordering::Relaxed);
         if status > 399 {
             counters.errors_status.fetch_add(1, Ordering::Relaxed);
+        }
+        if elapsed > timeout_dur {
+            counters.errors_timeout.fetch_add(1, Ordering::Relaxed);
+            continue; // a stream timeout need not kill the QUIC connection
         }
         if !latency.record(elapsed_us) {
             counters.errors_timeout.fetch_add(1, Ordering::Relaxed);
