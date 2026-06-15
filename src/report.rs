@@ -4,8 +4,6 @@
 // spaces" padding rule from print_units so printed magnitudes line up
 // identically to the original tool.
 
-use std::sync::atomic::Ordering;
-
 use crate::stats::Stats;
 use crate::units;
 
@@ -82,6 +80,7 @@ pub struct Report<'a> {
     pub complete: u64,
     pub bytes: u64,
     pub runtime_us: u64,
+    pub protocol: crate::config::ResolvedVersion,
     pub errors_connect: u64,
     pub errors_read: u64,
     pub errors_write: u64,
@@ -107,8 +106,8 @@ pub fn print_report(r: &Report) {
     let runtime_msg = units::format_time_us(r.runtime_us as f64);
     let bytes_msg = units::format_binary(r.bytes as f64);
     println!(
-        "  {} requests in {}, {}B read",
-        r.complete, runtime_msg, bytes_msg
+        "  {} requests in {}, {}B read [{}]",
+        r.complete, runtime_msg, bytes_msg, r.protocol.as_str()
     );
 
     if r.errors_connect != 0
@@ -162,10 +161,4 @@ mod tests {
         print_stats("Latency", &s, units::format_time_us);
         print_stats_latency(&s);
     }
-}
-
-// Re-export Ordering so the import above isn't flagged unused.
-#[allow(dead_code)]
-fn _ordering_use() -> Ordering {
-    Ordering::Relaxed
 }

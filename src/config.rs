@@ -25,6 +25,35 @@ pub enum Scheme {
     Https,
 }
 
+/// Which HTTP protocol version to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HttpVersion {
+    /// HTTP/1.1 (over TCP, or over TLS for https).
+    Http1,
+    /// HTTP/3 over QUIC. Forces QUIC transport regardless of scheme.
+    Http3,
+    /// Negotiate: for https, try HTTP/3 and fall back to HTTP/1.1 on failure.
+    /// For plain http, always uses HTTP/1.1.
+    #[default]
+    Auto,
+}
+
+/// The protocol actually used for the run (resolved after negotiation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedVersion {
+    Http1,
+    Http3,
+}
+
+impl ResolvedVersion {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ResolvedVersion::Http1 => "HTTP/1.1",
+            ResolvedVersion::Http3 => "HTTP/3",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub threads: u64,
@@ -41,6 +70,12 @@ pub struct Config {
     pub host: String,
     pub port: u16,
     pub url: String,
+    /// Requested protocol selection (default: Auto).
+    pub http_version: HttpVersion,
+    /// Concurrent streams per connection (HTTP/3 only; HTTP/1 is always 1).
+    pub streams_per_conn: u64,
+    /// Resolved after negotiation in main; the report prints this.
+    pub resolved: Option<ResolvedVersion>,
 }
 
 impl Config {
@@ -106,14 +141,23 @@ impl std::str::FromStr for HeaderArg {
     }
 }
 
+/// HTTP method for -X. Accepts both uppercase (POST) and lowercase (post)
+/// via aliases, since users naturally type method names in uppercase.
 #[derive(Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub enum MethodArg {
+    #[value(name = "GET", aliases = ["get"])]
     Get,
+    #[value(name = "POST", aliases = ["post"])]
     Post,
+    #[value(name = "PUT", aliases = ["put"])]
     Put,
+    #[value(name = "PATCH", aliases = ["patch"])]
     Patch,
+    #[value(name = "DELETE", aliases = ["delete"])]
     Delete,
+    #[value(name = "HEAD", aliases = ["head"])]
     Head,
+    #[value(name = "OPTIONS", aliases = ["options"])]
     Options,
 }
 
@@ -127,6 +171,27 @@ impl MethodArg {
             MethodArg::Delete => "DELETE",
             MethodArg::Head => "HEAD",
             MethodArg::Options => "OPTIONS",
+        }
+    }
+}
+
+/// CLI-facing HTTP version selector.
+#[derive(Clone, Debug, ValueEnum, PartialEq, Eq)]
+pub enum VersionArg {
+    /// Negotiate: https tries HTTP/3 and falls back to HTTP/1.1; http is HTTP/1.1.
+    Auto,
+    /// HTTP/1.1.
+    Http1,
+    /// HTTP/3 over QUIC.
+    Http3,
+}
+
+impl VersionArg {
+    pub fn to_http_version(&self) -> HttpVersion {
+        match self {
+            VersionArg::Auto => HttpVersion::Auto,
+            VersionArg::Http1 => HttpVersion::Http1,
+            VersionArg::Http3 => HttpVersion::Http3,
         }
     }
 }
@@ -181,6 +246,18 @@ pub struct Cli {
     #[arg(short = 'b', long = "body", value_name = "BODY")]
     body: Option<String>,
 
+    /// HTTP protocol version: auto (negotiate), http1, or http3
+    #[arg(long = "http", value_name = "VER", default_value = "auto")]
+    http_version: VersionArg,
+
+    /// Force HTTP/3 over QUIC (shorthand for --http http3)
+    #[arg(long = "http3", action = ArgAction::SetTrue)]
+    http3: bool,
+
+    /// Concurrent streams per connection (HTTP/3 only)
+    #[arg(long = "streams", value_name = "N", default_value = "1")]
+    streams_per_conn: MetricArg,
+
     /// Print version details
     #[arg(short = 'v', long = "version", action = ArgAction::SetTrue)]
     version: bool,
@@ -212,6 +289,9 @@ pub fn print_usage() {
          \x20     -X, --method   <METH>  HTTP method (default GET)  \n\
          \x20         --path         <P>  Request path (default /)  \n\
          \x20     -b, --body        <B>  Request body               \n\
+         \x20         --http <VER>       auto | http1 | http3        \n\
+         \x20         --http3            Force HTTP/3 over QUIC      \n\
+         \x20         --streams <N>      Concurrent streams (HTTP/3) \n\
          \x20     -v, --version          Print version details      \n\
          \x20                                                       \n\
          \x20 Numeric arguments may include a SI unit (1k, 1M, 1G)  \n\
@@ -271,6 +351,14 @@ pub fn parse_args() -> Config {
     let body = cli.body.map(|s| s.into_bytes()).unwrap_or_default();
     let headers: Vec<(String, String)> = cli.header.into_iter().map(|h| (h.0, h.1)).collect();
 
+    // Protocol selection. --http3 is a shorthand that forces http3.
+    let http_version = if cli.http3 {
+        HttpVersion::Http3
+    } else {
+        cli.http_version.to_http_version()
+    };
+    let streams_per_conn = cli.streams_per_conn.0;
+
     // Validation mirroring wrk.c:528-538.
     if threads == 0 || duration == 0 {
         eprintln!("invalid number of threads or duration");
@@ -278,6 +366,10 @@ pub fn parse_args() -> Config {
     }
     if connections == 0 || connections < threads {
         eprintln!("number of connections must be >= threads");
+        exit(1);
+    }
+    if streams_per_conn == 0 {
+        eprintln!("--streams must be >= 1");
         exit(1);
     }
 
@@ -288,6 +380,12 @@ pub fn parse_args() -> Config {
             exit(1);
         }
     };
+
+    // HTTP/3 requires QUIC/UDP, which only makes sense for https:// targets.
+    if matches!(http_version, HttpVersion::Http3) && scheme == Scheme::Http {
+        eprintln!("--http3 / --http http3 requires an https:// URL");
+        exit(1);
+    }
 
     Config {
         threads,
@@ -304,6 +402,9 @@ pub fn parse_args() -> Config {
         host,
         port,
         url,
+        http_version,
+        streams_per_conn,
+        resolved: None,
     }
 }
 
@@ -320,7 +421,7 @@ fn parse_url(url: &str) -> Result<(Scheme, String, u16), String> {
     };
     // authority ends at the first '/', '?', or '#'
     let auth_end = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .unwrap_or(rest.len());
     let authority = &rest[..auth_end];
     let (host, port) = if let Some(idx) = authority.rfind(':') {
@@ -410,6 +511,9 @@ mod tests {
             host: "example.com".into(),
             port: 80,
             url: "http://example.com/".into(),
+            http_version: HttpVersion::Auto,
+            streams_per_conn: 1,
+            resolved: None,
         };
         assert_eq!(cfg.host_header(), "example.com");
         cfg.port = 8080;

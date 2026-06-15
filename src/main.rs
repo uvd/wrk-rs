@@ -11,6 +11,7 @@
 mod config;
 mod connection;
 mod counting;
+mod h3;
 mod report;
 mod stats;
 mod units;
@@ -28,7 +29,13 @@ use stats::Stats;
 pub const MAX_THREAD_RATE_S: u64 = 10_000_000;
 
 fn main() {
-    let cfg = config::parse_args();
+    let mut cfg = config::parse_args();
+
+    // Resolve the protocol. For Auto + https, probe whether the server speaks
+    // HTTP/3 (QUIC); otherwise fall back to HTTP/1.1. For Auto + http, always
+    // HTTP/1.1. For an explicit --http3/--http http3, H3 is required.
+    let resolved = resolve_protocol(&cfg);
+    cfg.resolved = Some(resolved);
     let cfg = Arc::new(cfg);
 
     // Allocate global histograms.
@@ -40,42 +47,83 @@ fn main() {
     let counters = Arc::new(Counters::default());
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Build a TLS connector + server name once, if needed.
-    let (tls, server_name) = build_tls(&cfg);
-
-    // Print the run header (mirrors wrk.c:137-139).
+    // Print the run header (mirrors wrk.c:137-139), annotated with the
+    // resolved protocol and (for H3) the per-connection stream count.
     let time = units::format_time_s(cfg.duration as f64);
-    println!("Running {} test @ {}", time, cfg.url);
-    println!(
-        "  {} threads and {} connections",
-        cfg.threads, cfg.connections
-    );
+    print_run_header(&cfg, &time);
 
     // Distribute connections across threads (integer division, like wrk.c:107).
     let per_thread = cfg.connections / cfg.threads;
 
     let mut handles = Vec::with_capacity(cfg.threads as usize);
-    for _ in 0..cfg.threads {
-        let cfg = cfg.clone();
-        let latency = latency.clone();
-        let requests_stats = requests_stats.clone();
-        let counters = counters.clone();
-        let stop = stop.clone();
-        let tls = tls.clone();
-        let server_name = server_name.clone();
-        let handle = std::thread::spawn(move || {
-            worker::run_worker(
-                cfg,
-                per_thread,
-                latency,
-                requests_stats,
-                counters,
-                stop,
-                tls,
-                server_name,
+    match resolved {
+        config::ResolvedVersion::Http3 => {
+            // Quinn endpoints must be created inside a tokio runtime, and that
+            // runtime must outlive the endpoint (quinn spawns IO tasks on it).
+            // We create a persistent multi_thread runtime that lives for the
+            // whole run and leak it — fine for a short-lived CLI tool.
+            let shared_rt = Box::leak(Box::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap_or_else(|e| {
+                        eprintln!("unable to create QUIC runtime: {e}");
+                        exit(1);
+                    }),
+            ));
+            let endpoint = Arc::new(
+                shared_rt
+                    .block_on(async { h3::build_endpoint(cfg.insecure) })
+                    .unwrap_or_else(|e| {
+                        eprintln!("unable to create QUIC endpoint: {e}");
+                        exit(1);
+                    }),
             );
-        });
-        handles.push(handle);
+            for _ in 0..cfg.threads {
+                let cfg = cfg.clone();
+                let latency = latency.clone();
+                let requests_stats = requests_stats.clone();
+                let counters = counters.clone();
+                let stop = stop.clone();
+                let endpoint = endpoint.clone();
+                handles.push(std::thread::spawn(move || {
+                    worker::run_h3_worker(
+                        cfg,
+                        per_thread,
+                        latency,
+                        requests_stats,
+                        counters,
+                        stop,
+                        endpoint,
+                    );
+                }));
+            }
+        }
+        config::ResolvedVersion::Http1 => {
+            // Build a TLS connector + server name once, if needed.
+            let (tls, server_name) = build_tls(&cfg);
+            for _ in 0..cfg.threads {
+                let cfg = cfg.clone();
+                let latency = latency.clone();
+                let requests_stats = requests_stats.clone();
+                let counters = counters.clone();
+                let stop = stop.clone();
+                let tls = tls.clone();
+                let server_name = server_name.clone();
+                handles.push(std::thread::spawn(move || {
+                    worker::run_worker(
+                        cfg,
+                        per_thread,
+                        latency,
+                        requests_stats,
+                        counters,
+                        stop,
+                        tls,
+                        server_name,
+                    );
+                }));
+            }
+        }
     }
 
     let wall_start = Instant::now();
@@ -87,28 +135,21 @@ fn main() {
     }
 
     let runtime_us = wall_start.elapsed().as_micros() as u64;
-
-    // Coordinated-omission correction (mirrors wrk.c:168-171).
     let complete = counters.complete.load(Ordering::Relaxed);
-    let conns_per_thread = if cfg.threads > 0 {
-        cfg.connections / cfg.threads
-    } else {
-        0
-    };
+
+    // Coordinated-omission correction (mirrors wrk.c:168-171):
     // expected = runtime_us / (complete / connections)
-    if complete > 0 && cfg.connections > 0 {
-        let per_conn = complete / cfg.connections;
-        if per_conn > 0 {
-            let interval = (runtime_us / per_conn) as i64;
-            latency.correct(interval);
-        }
+    if let Some(per_conn) = complete.checked_div(cfg.connections)
+        && let Some(interval) = runtime_us.checked_div(per_conn)
+    {
+        latency.correct(interval as i64);
     }
-    let _ = conns_per_thread;
 
     let r = report::Report {
         complete,
         bytes: counters.bytes.load(Ordering::Relaxed),
         runtime_us,
+        protocol: resolved,
         errors_connect: counters.errors_connect.load(Ordering::Relaxed),
         errors_read: counters.errors_read.load(Ordering::Relaxed),
         errors_write: counters.errors_write.load(Ordering::Relaxed),
@@ -121,6 +162,83 @@ fn main() {
     report::print_report(&r);
 
     let _ = exit;
+}
+
+/// Resolve the effective protocol version, probing QUIC for Auto+https.
+fn resolve_protocol(cfg: &config::Config) -> config::ResolvedVersion {
+    use config::{HttpVersion, ResolvedVersion, Scheme};
+    match cfg.http_version {
+        HttpVersion::Http1 => ResolvedVersion::Http1,
+        HttpVersion::Http3 => ResolvedVersion::Http3,
+        HttpVersion::Auto => {
+            if cfg.scheme == Scheme::Https {
+                // Probe: open a throwaway tokio runtime, try a QUIC handshake
+                // with a short timeout. Success ⇒ HTTP/3, failure ⇒ HTTP/1.1.
+                let probe_ok = probe_quic(cfg);
+                if probe_ok {
+                    eprintln!("Negotiated HTTP/3 (QUIC)");
+                    ResolvedVersion::Http3
+                } else {
+                    eprintln!("HTTP/3 unavailable, falling back to HTTP/1.1");
+                    ResolvedVersion::Http1
+                }
+            } else {
+                ResolvedVersion::Http1
+            }
+        }
+    }
+}
+
+/// Attempt a QUIC handshake to the target. Used for auto-negotiation.
+fn probe_quic(cfg: &config::Config) -> bool {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    runtime.block_on(async {
+        let endpoint = match h3::build_endpoint(cfg.insecure) {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        // Resolve host:port to a SocketAddr.
+        let addr = match tokio::net::lookup_host((cfg.host.as_str(), cfg.port)).await {
+            Ok(mut it) => match it.next() {
+                Some(a) => a,
+                None => return false,
+            },
+            Err(_) => return false,
+        };
+        // Try to connect with a 1s budget.
+        let connecting = match endpoint.connect(addr, &cfg.host) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), connecting).await,
+            Ok(Ok(_conn))
+        )
+    })
+}
+
+/// Print the "Running ..." header, annotated with the resolved protocol.
+fn print_run_header(cfg: &config::Config, time: &str) {
+    let proto = cfg
+        .resolved
+        .map(|r| r.as_str())
+        .unwrap_or("HTTP/1.1");
+    let streams = if cfg.resolved == Some(config::ResolvedVersion::Http3) {
+        format!(", {} streams/conn", cfg.streams_per_conn)
+    } else {
+        String::new()
+    };
+    println!("Running {} test @ {} [{}{}]", time, cfg.url, proto, streams);
+    println!(
+        "  {} threads and {} connections",
+        cfg.threads, cfg.connections
+    );
 }
 
 fn build_tls(
@@ -162,8 +280,9 @@ fn build_tls(
 }
 
 /// A certificate verifier that accepts everything (used by --insecure).
+/// Public so the HTTP/3 (h3.rs) path can share the same verifier.
 #[derive(Debug)]
-struct NoVerifier;
+pub struct NoVerifier;
 
 impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     fn verify_server_cert(
