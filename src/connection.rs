@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use http_body_util::Full;
 use hyper::body::{Body, Frame};
 use hyper::client::conn::http1;
@@ -25,7 +25,6 @@ use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
 use crate::config::{Config, Scheme};
-use crate::counting::CountingStream;
 
 /// Counters accumulated by a single worker's connections. Each worker owns its
 /// own instance (passed by `Arc` to that worker's connection tasks); main sums
@@ -151,22 +150,30 @@ impl tokio::io::AsyncWrite for Transport {
 }
 
 /// A Future that drains a body frame-by-frame, dropping each frame without
-/// collecting — zero allocation per response. Bytes are already counted
-/// upstream by CountingStream. Registers the waker correctly so it never
+/// collecting — zero allocation per response. Returns the total body bytes
+/// drained, so callers can fold it into the byte counter without a separate
+/// CountingStream wrapper layer. Registers the waker correctly so it never
 /// busy-loops. Shared by the HTTP/1 and HTTP/2 paths.
 pub(crate) struct DrainBody<B> {
     body: B,
+    bytes: u64,
 }
 
 impl<B: Body + Unpin> Future for DrainBody<B> {
-    type Output = Result<(), B::Error>;
+    type Output = Result<u64, B::Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         loop {
             match Pin::new(&mut this.body).poll_frame(cx) {
-                Poll::Ready(Some(Ok(_frame))) => continue,
-                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Ready(Some(Ok(frame))) => {
+                    // Tally data-frame bytes; ignore trailers.
+                    if let Some(data) = frame.data_ref() {
+                        this.bytes += data.remaining() as u64;
+                    }
+                    continue;
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(this.bytes)),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
@@ -176,9 +183,10 @@ impl<B: Body + Unpin> Future for DrainBody<B> {
 
 /// Construct a draining future over a body. `pub(crate)` so the H2 path reuses
 /// the same zero-alloc drain instead of `BodyExt::collect` (which buffers the
-/// entire response body into a `Bytes` and then drops it).
+/// entire response body into a `Bytes` and then drops it). Returns the total
+/// body bytes drained on success.
 pub(crate) fn drain_body<B: Body + Unpin>(body: B) -> DrainBody<B> {
-    DrainBody { body }
+    DrainBody { body, bytes: 0 }
 }
 
 #[allow(dead_code)]
@@ -209,6 +217,13 @@ pub async fn run_connection(
     // per-request build path avoids re-parsing strings into HeaderName/
     // HeaderValue. (Mirrors wrk's !cfg.dynamic path, which renders the
     // request a single time.)
+    //
+    // NOTE: we deliberately do NOT cache a full `http::Request` template and
+    // clone it per request. `Request::clone` deep-copies the `HeaderMap`
+    // (its indices `Box<[Pos]>` + entries `Vec` + extras `Vec` = 3+ heap
+    // allocs per request). Rebuilding the Request each time with a single
+    // pre-sized `HeaderMap::with_capacity` allocation is cheaper, and the
+    // `HeaderName`/`HeaderValue` clones are just Bytes refcount incs.
     let mut static_headers: Vec<(http::HeaderName, http::HeaderValue)> =
         Vec::with_capacity(cfg.headers.len() + 2);
     static_headers.push((
@@ -228,13 +243,7 @@ pub async fn run_connection(
         }
     }
     let body_len = body_bytes.len();
-
-    // Pre-build a full request template once per connection. Cloning it per
-    // request is far cheaper than rebuilding the HeaderMap entry-by-entry:
-    // HeaderName/HeaderValue are Bytes-backed (atomic-inc only), Full<Bytes>
-    // is Copy, and the method/URI are cheap to clone. This is the biggest
-    // per-request allocation win.
-    let req_template: http::Request<Full<Bytes>> = build_request(&method, &cfg.path, &static_headers, body_bytes.clone());
+    let n_headers = static_headers.len() + (body_len > 0) as usize;
 
     while !stop.load(Ordering::Relaxed) {
         // ---- connect ----
@@ -246,15 +255,14 @@ pub async fn run_connection(
                 continue;
             }
         };
-        let bytes_read = Arc::new(AtomicU64::new(0));
-        let counting = TokioIo::new(CountingStream::new(transport, bytes_read.clone()));
-
         // Use the handshake Builder to tune buffer behaviour for our workload:
-        // tiny, fast responses over keep-alive TCP. A fixed small read buffer
-        // avoids the adaptive-buffer bookkeeping, and keeping writev on auto.
+        // tiny, fast responses over keep-alive TCP. writev(false) flattens to
+        // a single write() (no iovec setup) which is faster for single-buffer
+        // GET requests; read_buf_exact_size(8192) avoids adaptive-buffer cost.
         let (mut sender, conn) = match http1::Builder::new()
+            .writev(false)
             .read_buf_exact_size(Some(8192))
-            .handshake(counting)
+            .handshake(TokioIo::new(transport))
             .await
         {
             Ok(v) => v,
@@ -264,7 +272,10 @@ pub async fn run_connection(
             }
         };
         // Drive the connection in the background until it closes/errors.
-        tokio::spawn(async move {
+        // spawn_local (not tokio::spawn) keeps the driver on the same LocalSet
+        // queue as the request loop, avoiding a scheduler-path mismatch on
+        // every cross-wakeup between send_request and conn.
+        tokio::task::spawn_local(async move {
             let _ = conn.await;
         });
 
@@ -276,15 +287,23 @@ pub async fn run_connection(
         //    request cost on fast servers. Instead we stamp start time and
         //    only treat a request as timed-out if it actually overshoots the
         //    deadline (rare on a healthy server).
-        //  - Request is cloned from a template (cheap Bytes refcount incs).
+        //  - Request is rebuilt each iteration with a pre-sized HeaderMap
+        //    (1 alloc) rather than cloning a template (3+ allocs).
         //  - `Instant::now()` is taken once per request (not twice).
-        //  - Counters use relaxed ordering throughout.
+        //  - Per-request counters (complete, bytes) are accumulated in local
+        //    `u64`s (plain integer adds, ~0 cost) and flushed to the shared
+        //    `Arc<Counters>` only on reconnect/exit — mirroring wrk's
+        //    `thread->complete++`. rate_counter stays per-request because the
+        //    100ms rate recorder must sample it for the Req/Sec histogram.
+        let mut local_complete: u64 = 0;
         loop {
             if stop.load(Ordering::Relaxed) {
+                // Flush local accumulators before exiting.
+                counters.complete.fetch_add(local_complete, Ordering::Relaxed);
                 return;
             }
 
-            let req = req_template.clone();
+            let req = build_request(&method, &cfg.path, &static_headers, n_headers, body_bytes.clone());
 
             let start = Instant::now();
             rate_counter.fetch_add(1, Ordering::Relaxed);
@@ -293,45 +312,76 @@ pub async fn run_connection(
                 Ok(r) => r,
                 Err(_) => {
                     counters.errors_write.fetch_add(1, Ordering::Relaxed);
+                    // Flush before reconnecting so these aren't lost.
+                    counters.complete.fetch_add(local_complete, Ordering::Relaxed);
                     break;
                 }
             };
             let status = resp.status().as_u16();
-            // Zero-alloc drain: drop frames one at a time; bytes already counted.
+            let resp_headers = resp.headers().clone();
+            // Zero-alloc drain: drop frames one at a time. Bytes are counted
+            // here (not by CountingStream, which we removed) by estimating
+            // header + body bytes once the response is fully read.
             let mut drain = drain_body(resp.into_body());
-            if (&mut drain).await.is_err() {
-                counters.errors_read.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
+            let body_bytes_recv = match (&mut drain).await {
+                Ok(n) => n,
+                Err(_) => {
+                    counters.errors_read.fetch_add(1, Ordering::Relaxed);
+                    counters.complete.fetch_add(local_complete, Ordering::Relaxed);
+                    break;
+                }
+            };
+            // Estimate total response bytes: status line + headers + body.
+            // This approximates the on-wire byte count (the original wrk counts
+            // raw socket bytes including headers). For tiny responses the
+            // header portion dominates, so this keeps Transfer/sec faithful.
+            let header_bytes = estimate_response_bytes(status, &resp_headers);
+            counters.bytes.fetch_add(header_bytes + body_bytes_recv, Ordering::Relaxed);
 
             let elapsed = start.elapsed();
             let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
 
-            counters.complete.fetch_add(1, Ordering::Relaxed);
+            local_complete += 1;
             if status > 399 {
                 counters.errors_status.fetch_add(1, Ordering::Relaxed);
             }
             if elapsed > timeout_dur {
                 // Request exceeded the timeout — count it and reconnect.
                 counters.errors_timeout.fetch_add(1, Ordering::Relaxed);
+                counters.complete.fetch_add(local_complete, Ordering::Relaxed);
                 break;
             }
             if !latency.record(elapsed_us) {
                 counters.errors_timeout.fetch_add(1, Ordering::Relaxed);
             }
-            let b = bytes_read.swap(0, Ordering::Relaxed);
-            counters.bytes.fetch_add(b, Ordering::Relaxed);
         }
     }
 
-    // Reference unused vars to keep them in scope for clarity.
     let _ = body_len;
+}
+
+/// Estimate the on-wire byte count of an HTTP response's status line + headers.
+/// Approximates what a raw socket byte counter would see, so Transfer/sec
+/// stays comparable to the original wrk (which counts all socket bytes).
+/// Format: "HTTP/1.1 200 OK\r\n" + "Name: Value\r\n" per header + "\r\n".
+pub(crate) fn estimate_response_bytes(status: u16, headers: &http::HeaderMap) -> u64 {
+    // Status line: "HTTP/1.1 " (8) + status digits (3) + " " (1) + reason +
+    // "\r\n" (2). Reason phrases are short; approximate as ~16 bytes.
+    let mut n: u64 = 16;
+    for (name, val) in headers {
+        // "Name: Value\r\n"
+        n += name.as_str().len() as u64 + 2 + val.len() as u64 + 2;
+    }
+    n += 2; // final "\r\n"
+    let _ = status;
+    n
 }
 
 fn build_request(
     method: &http::Method,
     path: &str,
     headers: &[(http::HeaderName, http::HeaderValue)],
+    n_headers: usize,
     body: Bytes,
 ) -> http::Request<Full<Bytes>> {
     let body_len = body.len();
@@ -341,7 +391,9 @@ fn build_request(
         .body(Full::new(body))
         .expect("valid request");
     let map = req.headers_mut();
-    map.reserve(headers.len() + 1);
+    // Pre-size to avoid reallocation: the map allocates one Vec of the right
+    // capacity rather than the 3+ allocs that Request::clone() incurs.
+    map.reserve(n_headers);
     for (name, val) in headers {
         map.append(name.clone(), val.clone());
     }
@@ -362,6 +414,10 @@ async fn connect(
     let addr = format!("{}:{}", cfg.host, cfg.port);
     let tcp = TcpStream::connect(addr).await?;
     let _ = tcp.set_nodelay(true);
+    // On Linux, TCP_QUICKACK reduces ACK latency for small request/response
+    // patterns. It's a hint the kernel may reset, but sticks for bursts.
+    #[cfg(target_os = "linux")]
+    let _ = tcp.set_quickack(true);
 
     match cfg.scheme {
         Scheme::Http => Ok(Transport::Plain(tcp)),

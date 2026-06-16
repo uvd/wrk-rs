@@ -25,7 +25,16 @@ use tokio::task::LocalSet;
 /// quietly creates `N × num_cpus` tokio threads contending for the cores, and
 /// throughput *falls* as `-t` rises. We measured exactly that regression.
 fn worker_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    Builder::new_current_thread().enable_all().build()
+    Builder::new_current_thread()
+        .enable_all()
+        // event_interval(1): for a pure-IO keep-alive loop that awaits every
+        // iteration, poll the I/O driver every tick instead of every 61 (the
+        // default). This cuts wakeup latency for the tight request loop.
+        // max_blocking_threads(1): we never spawn_blocking, so trim the
+        // blocking pool's structures to the minimum.
+        .event_interval(1)
+        .max_blocking_threads(1)
+        .build()
 }
 
 use crate::config::Config;

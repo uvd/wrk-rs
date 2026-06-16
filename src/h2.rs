@@ -6,23 +6,23 @@
 // per connection. This mirrors h3.rs but over TLS+TCP using hyper's http2
 // client.
 //
-// Latency, bytes, and error accounting reuse the same `Counters` and `Stats`
-// as the other paths.
+// Hot-path optimisations mirror connection.rs (HTTP/1): per-task local
+// counters flushed on exit, byte counting via DrainBody (no CountingStream
+// wrapper layer), spawn_local for the connection driver.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::client::conn::http2;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use crate::config::Config;
-use crate::connection::Counters;
-use crate::counting::CountingStream;
+use crate::connection::{Counters, drain_body, estimate_response_bytes};
 
 /// Run one HTTP/2 connection: open a TLS+H2 connection and drive
 /// `streams_per_conn` concurrent stream-tasks until `stop` or conn failure.
@@ -33,7 +33,7 @@ pub async fn run_h2_connection(
     stop: Arc<AtomicBool>,
     tls: TlsConnector,
     server_name: rustls::pki_types::ServerName<'static>,
-    rate_counter: Arc<AtomicU64>,
+    rate_counter: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let body_bytes: Bytes = if cfg.body.is_empty() {
         Bytes::new()
@@ -77,6 +77,8 @@ pub async fn run_h2_connection(
             }
         };
         let _ = tcp.set_nodelay(true);
+        #[cfg(target_os = "linux")]
+        let _ = tcp.set_quickack(true);
         let tls = match tls.clone().connect(server_name.clone(), tcp).await {
             Ok(t) => t,
             Err(_) => {
@@ -84,26 +86,22 @@ pub async fn run_h2_connection(
                 continue;
             }
         };
-        let bytes_read = Arc::new(AtomicU64::new(0));
-        let counting = TokioIo::new(CountingStream::new(tls, bytes_read.clone()));
 
         // ---- H2 handshake ----
-        let (sender, conn) = match http2::handshake(TokioExecutor::new(), counting).await {
+        let (sender, conn) = match http2::handshake(TokioExecutor::new(), TokioIo::new(tls)).await {
             Ok(v) => v,
             Err(_) => {
                 counters.errors_connect.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         };
-        // Drive the H2 connection in the background.
-        let _timer = TokioTimer::new();
-        tokio::spawn(async move {
+        // Drive the H2 connection in the background. spawn_local keeps the
+        // driver on the same LocalSet queue as the stream tasks.
+        tokio::task::spawn_local(async move {
             let _ = conn.await;
         });
 
         // Spawn `streams_per_conn` concurrent stream-tasks sharing the sender.
-        // Build the request template once; stream tasks clone it per request.
-        let req_template = build_h2_request(&method, &full_uri, &static_headers, body_bytes.clone());
         let mut stream_handles = Vec::new();
         for _ in 0..cfg.streams_per_conn {
             let counters = counters.clone();
@@ -111,16 +109,20 @@ pub async fn run_h2_connection(
             let stop = stop.clone();
             let sender = sender.clone();
             let rate_counter = rate_counter.clone();
-            let bytes_read = bytes_read.clone();
-            let req_template = req_template.clone();
-            stream_handles.push(tokio::spawn(run_h2_stream(
+            let static_headers = static_headers.clone();
+            let full_uri = full_uri.clone();
+            let body_bytes = body_bytes.clone();
+            let method = method.clone();
+            stream_handles.push(tokio::task::spawn_local(run_h2_stream(
                 counters,
                 latency,
                 stop,
                 sender,
-                req_template,
+                static_headers,
+                full_uri,
+                body_bytes,
+                method,
                 rate_counter,
-                bytes_read,
                 timeout_dur,
             )));
         }
@@ -138,13 +140,16 @@ async fn run_h2_stream(
     latency: Arc<crate::stats::Stats>,
     stop: Arc<AtomicBool>,
     mut sender: http2::SendRequest<Full<Bytes>>,
-    req_template: http::Request<Full<Bytes>>,
-    rate_counter: Arc<AtomicU64>,
-    bytes_read: Arc<AtomicU64>,
+    static_headers: Arc<http::HeaderMap>,
+    full_uri: http::Uri,
+    body_bytes: Bytes,
+    method: http::Method,
+    rate_counter: Arc<std::sync::atomic::AtomicU64>,
     timeout_dur: Duration,
 ) {
+    let mut local_complete: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
-        let req = req_template.clone();
+        let req = build_h2_request(&method, &full_uri, &static_headers, body_bytes.clone());
 
         let start = Instant::now();
         rate_counter.fetch_add(1, Ordering::Relaxed);
@@ -153,36 +158,41 @@ async fn run_h2_stream(
             Ok(r) => r,
             Err(_) => {
                 counters.errors_write.fetch_add(1, Ordering::Relaxed);
+                counters.complete.fetch_add(local_complete, Ordering::Relaxed);
                 return;
             }
         };
         let status = resp.status().as_u16();
-        // Drain the body frame-by-frame (zero-alloc). Bytes are counted by
-        // CountingStream at the TLS layer, so we just drop each frame. This
-        // replaces an earlier `BodyExt::collect` that buffered the whole
-        // response into a `Bytes` and then threw it away — pure waste per
-        // request on the H2 hot path.
-        if crate::connection::drain_body(resp.into_body()).await.is_err() {
-            counters.errors_read.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
+        let resp_headers = resp.headers().clone();
+        // Zero-alloc drain; tally body bytes. No CountingStream wrapper.
+        let body_bytes_recv = match drain_body(resp.into_body()).await {
+            Ok(n) => n,
+            Err(_) => {
+                counters.errors_read.fetch_add(1, Ordering::Relaxed);
+                counters.complete.fetch_add(local_complete, Ordering::Relaxed);
+                return;
+            }
+        };
+        let header_bytes = estimate_response_bytes(status, &resp_headers);
+        counters.bytes.fetch_add(header_bytes + body_bytes_recv, Ordering::Relaxed);
 
         let elapsed = start.elapsed();
         let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
-        counters.complete.fetch_add(1, Ordering::Relaxed);
+        local_complete += 1;
         if status > 399 {
             counters.errors_status.fetch_add(1, Ordering::Relaxed);
         }
         if elapsed > timeout_dur {
             counters.errors_timeout.fetch_add(1, Ordering::Relaxed);
+            counters.complete.fetch_add(local_complete, Ordering::Relaxed);
             return;
         }
         if !latency.record(elapsed_us) {
             counters.errors_timeout.fetch_add(1, Ordering::Relaxed);
         }
-        let b = bytes_read.swap(0, Ordering::Relaxed);
-        counters.bytes.fetch_add(b, Ordering::Relaxed);
     }
+    // Flush local accumulator on clean exit.
+    counters.complete.fetch_add(local_complete, Ordering::Relaxed);
 }
 
 fn build_h2_request(

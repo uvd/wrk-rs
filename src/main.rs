@@ -10,7 +10,6 @@
 
 mod config;
 mod connection;
-mod counting;
 mod h2;
 mod h3;
 mod report;

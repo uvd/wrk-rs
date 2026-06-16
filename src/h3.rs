@@ -138,16 +138,15 @@ pub async fn run_h3_connection(
             }
         };
 
-        // Drive the HTTP/3 control connection in the background.
-        let drive_stop = stop.clone();
-        tokio::spawn(async move {
+        // Drive the HTTP/3 control connection in the background. spawn_local
+        // keeps the driver on the same LocalSet queue as the stream tasks.
+        tokio::task::spawn_local(async move {
             let _ = drive_conn.wait_idle().await;
-            let _ = drive_stop;
         });
 
         // Spawn `streams_per_conn` concurrent stream-tasks. Build the request
         // template once; stream tasks clone it per request (cheap — Request<()>
-        // and HeaderMap are Bytes-backed).
+        // and HeaderMap are Bytes-backed). spawn_local to stay on the LocalSet.
         let req_template = build_h3_request(&method, &full_uri, &static_headers, &body_bytes);
         let mut stream_handles = Vec::new();
         for _ in 0..cfg.streams_per_conn {
@@ -157,7 +156,7 @@ pub async fn run_h3_connection(
             let send_request = send_request.clone();
             let rate_counter = rate_counter.clone();
             let req_template = req_template.clone();
-            stream_handles.push(tokio::spawn(run_h3_stream(
+            stream_handles.push(tokio::task::spawn_local(run_h3_stream(
                 counters,
                 latency,
                 stop,
@@ -176,8 +175,6 @@ pub async fn run_h3_connection(
 
 /// Run one HTTP/3 stream: send requests back-to-back over a single
 /// multiplexed stream slot until `stop` or the connection errors.
-/// Run one HTTP/3 stream: send requests back-to-back over a single
-/// multiplexed stream slot until `stop` or the connection errors.
 #[allow(clippy::too_many_arguments)]
 async fn run_h3_stream<B>(
     counters: Arc<Counters>,
@@ -193,6 +190,7 @@ async fn run_h3_stream<B>(
 where
     B: OpenStreams<Bytes> + Clone + Send + Sync + 'static,
 {
+    let mut local_complete: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         let req = req_template.clone();
 
@@ -203,17 +201,19 @@ where
             Ok(v) => v,
             Err(H3ExchangeError::Send) => {
                 counters.errors_write.fetch_add(1, Ordering::Relaxed);
+                counters.complete.fetch_add(local_complete, Ordering::Relaxed);
                 return; // connection is broken; the connection task will reconnect
             }
             Err(H3ExchangeError::Recv) => {
                 counters.errors_read.fetch_add(1, Ordering::Relaxed);
+                counters.complete.fetch_add(local_complete, Ordering::Relaxed);
                 return;
             }
         };
 
         let elapsed = start.elapsed();
         let elapsed_us = elapsed.as_micros().min(u64::MAX as u128) as u64;
-        counters.complete.fetch_add(1, Ordering::Relaxed);
+        local_complete += 1;
         if status > 399 {
             counters.errors_status.fetch_add(1, Ordering::Relaxed);
         }
@@ -229,6 +229,7 @@ where
         // the application payload.
         counters.bytes.fetch_add(body_bytes_recv, Ordering::Relaxed);
     }
+    counters.complete.fetch_add(local_complete, Ordering::Relaxed);
 }
 
 enum H3ExchangeError {
